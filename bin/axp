@@ -720,8 +720,9 @@ def claude_command(model, effort, edit, worktree, handle, max_usd, task_id, sche
 
 
 def run_engine(engine, *, model, effort, edit, worktree, handle, brief, raw_dir, task_id,
-               env, cwd, timeout, max_usd, attempt=""):
-    """Run one worker turn. Returns {result, handle, cost, seconds, error}."""
+               env, cwd, timeout, max_usd, attempt="", cancel_files=()):
+    """Run one worker turn. Returns {result, handle, cost, seconds, error}.
+    cancel_files: markers that, if present once the pid is written, stop the worker at once."""
     stem = raw_dir / f"{task_id}{attempt}"
     out = {"result": None, "handle": handle, "cost": {}, "seconds": 0, "error": None, "model_id": None}
     if engine == "codex":
@@ -739,6 +740,10 @@ def run_engine(engine, *, model, effort, edit, worktree, handle, brief, raw_dir,
             proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=so, stderr=se, text=True,
                                     env=env, cwd=cwd, start_new_session=True)
             pid_file.write_text(str(proc.pid))
+            # Cancel writes its marker before scanning for pid files, and we check the marker only
+            # after writing ours, so either cancel finds this pid or we find the marker.
+            if any(Path(f).exists() for f in cancel_files):
+                kill_group(proc.pid)
             try:
                 proc.communicate(brief, timeout=timeout)
             except subprocess.TimeoutExpired:
@@ -940,33 +945,52 @@ def cmd_run_close(a):
 
 
 def close_run(store, run_id, results=None):
-    """Close a run. A parent that waits on it receives its results as inputs to its next stages."""
+    """Close a run. A parent that waits on it receives its results as inputs to its next stages.
+    The parent is updated first, so a failure there leaves the child open and `axp run close`
+    can simply be retried; closing an already-closed child re-delivers to a parent still waiting."""
     d = store.run_dir(run_id)
     for art in results or []:
         store.find_artifact(art)
     with store.lock():
         run = read_json(d / "run.json")
+        parent = run.get("parent") if run.get("parent_waits") else None
         if run["status"] == "closed":
-            return {"run": run_id, "status": "closed", "results": run.get("results", [])}
+            results = run.get("results", [])
+            delivered = deliver_to_parent(store, parent, run_id, results) if parent else False
+            return {"run": run_id, "status": "closed", "results": results, "parent": run.get("parent"),
+                    "redelivered": delivered}
         if results is None:
             state = load_state(store, run_id)
             final = [s for s in state.get("stages", {}).values() if s.get("status") == "done" and s.get("outputs")]
             results = final[-1]["outputs"] if final else []
+        if parent:
+            deliver_to_parent(store, parent, run_id, results)
         run.update(status="closed", closed=now(), results=list(results))
         write_json(d / "run.json", run)
         store.ledger(run_id, "run.closed", host_engine(), results=list(results))
-        parent = run.get("parent")
-        if parent and run.get("parent_waits"):
-            ps = load_state(store, parent)
-            ps["waiting_on"] = [c for c in ps.get("waiting_on", []) if c != run_id]
-            ps.setdefault("child_results", []).extend(r for r in results if r not in ps["child_results"])
-            if ps.get("checkpoint", {}) and ps["checkpoint"].get("kind") == "waiting-child" and not ps["waiting_on"]:
-                store.ledger(parent, "checkpoint.resolved", "axp", choice="child-closed", child=run_id)
-                ps["checkpoint"] = None
-            save_state(store, parent, ps)
-            for art in results:
-                store.ledger(parent, "artifact.registered", "axp", artifact=art, from_child=run_id)
-    return {"run": run_id, "status": "closed", "results": list(results), "parent": parent}
+    return {"run": run_id, "status": "closed", "results": list(results), "parent": run.get("parent")}
+
+
+def deliver_to_parent(store, parent, run_id, results):
+    """Hand a child's results to a parent that waits on it. Idempotent; the caller holds the lock.
+    Returns True if the parent was still waiting on this child."""
+    try:
+        ps = load_state(store, parent)  # fails before anything is written
+    except (json.JSONDecodeError, OSError) as e:
+        raise AxpError(f"parent run {parent} has unreadable panel state ({e}); fix it and re-run `axp run close`")
+    if run_id not in ps.get("waiting_on", []):
+        return False
+    ps["waiting_on"] = [c for c in ps["waiting_on"] if c != run_id]
+    ps.setdefault("child_results", []).extend(r for r in results if r not in ps["child_results"])
+    resolved = (ps.get("checkpoint") or {}).get("kind") == "waiting-child" and not ps["waiting_on"]
+    if resolved:
+        ps["checkpoint"] = None
+    save_state(store, parent, ps)
+    if resolved:
+        store.ledger(parent, "checkpoint.resolved", "axp", choice="child-closed", child=run_id)
+    for art in results:
+        store.ledger(parent, "artifact.registered", "axp", artifact=art, from_child=run_id)
+    return True
 
 
 def cmd_run_list(a):
@@ -1656,6 +1680,8 @@ def run_stage(store, run_id, spec, state, stage):
     done_rounds = len(prior.get("rounds", [])) if prior.get("extra_rounds") else 0
     all_summaries, history = [], prior.get("rounds", []) if prior.get("extra_rounds") else []
     for r in range(done_rounds + 1, rounds + 1):
+        if stage_cancel_marker(store.run_dir(run_id), name).exists():
+            break  # cancelled during an earlier round: start no more
         if stage.get("when") == "disagreement" and not prior.get("extra_rounds") and \
                 not disagreement(spec, list(latest.values())):
             break
@@ -1778,6 +1804,7 @@ def advance(store, run_id, on_checkpoint="pause"):
                         save_state(store, run_id, state)
                     return state
 
+                stage_cancel_marker(d, name).unlink(missing_ok=True)  # a fresh start isn't cancelled
                 mutate_state(store, run_id, lambda s: s["stages"].__setitem__(
                     name, {**st, "status": "running", "type": stage["type"], "started": now(),
                            "spec_version": read_json(d / "run.json")["spec_version"]}))
@@ -2172,6 +2199,8 @@ def redo_stage(store, run_id, name, *, with_=(), revise=False, brief=None, by):
     stale = downstream_of(spec, name)
     stale_reported = [n for n in stale if spec_stage(spec, n)["type"] != "gate"]
 
+    stage_cancel_marker(d, name).unlink(missing_ok=True)
+
     def redo(state):
         old = state["stages"].get(name, {})
         state["stages"][name] = {"status": "pending", "redo": {"fresh": not revise, "brief": brief},
@@ -2203,6 +2232,10 @@ def redo_stage(store, run_id, name, *, with_=(), revise=False, brief=None, by):
             "next": "axp council resume"}
 
 
+def stage_cancel_marker(run_dir, stage):
+    return Path(run_dir) / "raw" / f"stage-{stage}.cancelled"
+
+
 def spec_stage(spec, name):
     return next(s for s in spec["stages"] if s["name"] == name)
 
@@ -2232,17 +2265,24 @@ def cmd_stage_cancel(a):
         return
     if status != "running":
         raise AxpError(f"stage {a.stage} is {status}; nothing to cancel")
-    killed = []
+    # Order matters: mark first, then scan. A worker checks the marker after writing its pid,
+    # so every worker is either found here or stops itself (see run_engine).
+    mutate_state(store, run_id, lambda s: s["stages"][a.stage].update(status="cancelled", cancelled=now()))
+    stage_cancel_marker(d, a.stage).touch()
+    killed, marked = [], []
+    finished = {ev["task"] for ev in store.read_ledger(run_id) if ev["event"] in ("task.completed", "task.failed")}
     for ev in store.read_ledger(run_id):
         if ev["event"] == "task.dispatched" and (ev.get("data") or {}).get("stage") == a.stage:
             t = ev["task"]
+            if t in finished:
+                continue
+            (d / "raw" / f"{t}.cancelled").touch()
+            marked.append(t)
             pid_file = d / "raw" / f"{t}.pid"
             if pid_file.exists():
-                (d / "raw" / f"{t}.cancelled").touch()
                 kill_group(int(pid_file.read_text()))
                 killed.append(t)
-    mutate_state(store, run_id, lambda s: s["stages"][a.stage].update(status="cancelled", cancelled=now()))
-    store_ledger_locked(store, run_id, "stage.cancelled", stage=a.stage, tasks=killed)
+    store_ledger_locked(store, run_id, "stage.cancelled", stage=a.stage, tasks=killed, marked=marked)
     emit({"run": run_id, "cancelled": a.stage, "stopped_tasks": killed,
           "next": f"axp stage redo {a.stage}  or  axp panel amend --skip {a.stage} --reason …"})
 
@@ -2364,15 +2404,21 @@ def dispatch(store, run_id, *, member, brief, role=None, engine=None, model=None
                      edit=bool(edit), stage=stage, inputs=[r["id"] for r in input_recs])
 
     env = child_env(depth, chain, run_id, task_id)
-    common = dict(model=model, effort=effort, edit=edit, worktree=worktree, raw_dir=d / "raw",
-                  task_id=task_id, env=env, cwd=store.root, timeout=timeout, max_usd=max_usd)
     cancelled = d / "raw" / f"{task_id}.cancelled"
+    markers = [cancelled] + ([stage_cancel_marker(d, stage)] if stage else [])
+    common = dict(model=model, effort=effort, edit=edit, worktree=worktree, raw_dir=d / "raw",
+                  task_id=task_id, env=env, cwd=store.root, timeout=timeout, max_usd=max_usd,
+                  cancel_files=markers)
+    is_cancelled = lambda: any(m.exists() for m in markers)
     try:
-        out = run_engine(engine, handle=handle, brief=full_brief, **common)
+        if is_cancelled():  # the stage was cancelled before this worker started
+            out = {"result": None, "handle": handle, "cost": {}, "seconds": 0, "error": "cancelled", "model_id": None}
+        else:
+            out = run_engine(engine, handle=handle, brief=full_brief, **common)
         schema = load_schema()
         errors = validate(out["result"], schema) if out["result"] is not None else []
         repaired = False
-        if cancelled.exists():
+        if is_cancelled():
             out.update(result=None, error="cancelled")
             errors = []
         elif (out["result"] is None and out["handle"] and "timed out" not in (out["error"] or "")) or errors:
