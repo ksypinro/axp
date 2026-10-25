@@ -962,3 +962,108 @@ class TestInstall(unittest.TestCase):
             self.assertEqual(sorted(p.name for p in (codex / "skills").iterdir()), ["mine"])
             self.assertEqual(list((claude / "agents").glob("axp-*")), [])
             self.assertNotIn("axp", (codex / "rules" / "default.rules").read_text())
+
+
+# ---------------------------------------------------------------- fixes from the gpt-6-luna review
+
+class TestWorkerStopsItself(unittest.TestCase):
+    def test_worker_killed_when_cancel_marker_exists_after_pid_write(self):
+        with tempfile.TemporaryDirectory() as d:
+            marker = Path(d, "stage-debate.cancelled")
+            marker.touch()
+            with mock.patch.object(axp, "codex_command", lambda *a, **k: ["sleep", "30"]):
+                started = time.time()
+                out = axp.run_engine("codex", model="m", effort="low", edit=False, worktree=False, handle=None,
+                                     brief="", raw_dir=Path(d), task_id="t_1", env=dict(os.environ), cwd=d,
+                                     timeout=60, max_usd=None, cancel_files=[marker])
+            self.assertLess(time.time() - started, 10)
+            self.assertEqual(out["error"], "worker stopped by signal 15")
+            self.assertFalse(Path(d, "t_1.pid").exists())
+
+
+class TestCancelRace(PanelTest):
+    def start(self, extra=""):
+        data = self.council("run", "--inline", INLINE + " checkpoints: after-each-stage orchestrator: claude/opus@high" + extra)
+        return data, axp.Store.find(), self.run_dir(data["run"])
+
+    def test_cancel_marks_tasks_that_have_no_pid_yet(self):
+        data, store, d = self.start()
+        with store.lock():
+            store.ledger(data["run"], "task.dispatched", "test", "t_nopid", stage="debate", member="critic")
+        axp.mutate_state(store, data["run"], lambda s: s["stages"].__setitem__("debate", {"status": "running"}))
+        code, r, err = self.axp("stage", "cancel", "debate")
+        self.assertEqual(code, 0, err)
+        self.assertEqual((r["stopped_tasks"], (d / "raw" / "t_nopid.cancelled").exists()), ([], True))
+        self.assertTrue(axp.stage_cancel_marker(d, "debate").exists())
+        code, r, err = self.axp("stage", "redo", "debate")
+        self.assertEqual(code, 0, err)
+        self.assertFalse(axp.stage_cancel_marker(d, "debate").exists())  # a redo starts clean
+
+    def test_dispatch_refuses_to_start_a_worker_in_a_cancelled_stage(self):
+        data, store, d = self.start()
+        axp.stage_cancel_marker(d, "debate").touch()
+        calls = len(self.fake.calls)
+        code, s = axp.dispatch(store, data["run"], member="late", role="critic", brief="Review", stage="debate")
+        self.assertEqual((code, s["status"], s["error"]), (1, "failed", "cancelled"))
+        self.assertEqual(len(self.fake.calls), calls)  # no engine was started
+
+    def test_cancelled_rebuttal_starts_no_more_rounds(self):
+        fake = self.fake
+        original = FakePanel.__call__
+
+        def cancel_in_round_one(engine, **kw):
+            out = original(fake, engine, **kw)
+            if "Panel stage: rebuttal" in kw["brief"] and "Round 1." in kw["brief"]:
+                store = axp.Store.find()
+                run_id = kw["env"]["AXP_RUN"]
+                axp.mutate_state(store, run_id, lambda s: s["stages"]["rebuttal"].update(status="cancelled"))
+                axp.stage_cancel_marker(store.run_dir(run_id), "rebuttal").touch()
+            return out
+
+        self.patch.stop()
+        self.patch = mock.patch.object(axp, "run_engine", cancel_in_round_one)
+        self.patch.start()
+        data = self.council("run", "--inline", INLINE + " rounds: 3 checkpoints: none orchestrator: claude/opus@high")
+        rebut = [c for c in fake.calls if "Panel stage: rebuttal" in c["brief"]]
+        self.assertEqual({re.search(r"Round (\d+)", c["brief"]).group(1) for c in rebut}, {"1"})
+        self.assertEqual(data["checkpoint"]["kind"], "cancelled")
+
+
+class TestChildClose(PanelTest):
+    def parent_and_child(self):
+        parent = self.council("run", "--inline", INLINE + " checkpoints: after-each-stage orchestrator: claude/opus@high")
+        code, child, err = self.axp("run", "new", "child", "--parent", parent["run"], "--wait", "--no-switch")
+        self.assertEqual(code, 0, err)
+        store = axp.Store.find()
+        with store.lock():
+            art, rec = axp.write_artifact(store, child["run"], kind="decision", title="D", content="x",
+                                          derived_from=[], author={"engine": "claude", "member": "orchestrator"})
+            store.index(rec)
+        return parent["run"], child["run"], art
+
+    def test_parent_failure_leaves_child_open_and_retry_delivers(self):
+        pid, cid, art = self.parent_and_child()
+        state_file = self.run_dir(pid) / "council.json"
+        good = state_file.read_text()
+        state_file.write_text("{not json")
+        code, _, err = self.axp("run", "close", "--run", cid, "--result", art)
+        self.assertEqual(code, 2)
+        self.assertIn("unreadable panel state", err)
+        self.assertEqual(json.loads((self.run_dir(cid) / "run.json").read_text())["status"], "open")
+        state_file.write_text(good)
+        code, r, err = self.axp("run", "close", "--run", cid, "--result", art)
+        self.assertEqual(code, 0, err)
+        ps = json.loads(state_file.read_text())
+        self.assertEqual((ps["waiting_on"], ps["child_results"]), ([], [art]))
+
+    def test_closed_child_redelivers_to_a_parent_still_waiting(self):
+        pid, cid, art = self.parent_and_child()
+        run_file = self.run_dir(cid) / "run.json"
+        run = json.loads(run_file.read_text())
+        run.update(status="closed", results=[art])  # closed by the old code, parent never told
+        run_file.write_text(json.dumps(run))
+        code, r, err = self.axp("run", "close", "--run", cid)
+        self.assertEqual((code, r["redelivered"]), (0, True), err)
+        self.assertEqual(json.loads((self.run_dir(pid) / "council.json").read_text())["child_results"], [art])
+        code, r, _ = self.axp("run", "close", "--run", cid)
+        self.assertFalse(r["redelivered"])  # idempotent

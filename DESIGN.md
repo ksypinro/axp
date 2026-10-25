@@ -628,7 +628,8 @@ on:
 - **Members are reused across stages.** A member keeps its session from stage to stage. A redo uses fresh sessions unless `--revise` is passed, and an amendment that changes a member that already ran re-seats it automatically.
 - **Redo marks downstream stages stale and reopens later gates.** Resume stops at stale stages until each is redone or `--keep-stale` is passed.
 - **Cancel stops the worker's whole process group.** Workers now start in their own session with a pid file, and cancel marks the task so it isn't sent for schema repair. On a stage that hasn't started, cancel skips it.
-- **Child runs:** `--wait` puts a `waiting-child` checkpoint on the parent. `axp run close` (automatic when a child's panel finishes) passes the child's final outputs to every later stage of the parent.
+  - **Race fix (found by a gpt-6-luna@low review of this repo):** cancel first marks the stage cancelled and writes a stage-level marker, then scans. A worker checks that marker right after writing its pid, so a worker starting at that moment is either found by the scan or stops itself. `dispatch` won't start a worker in a cancelled stage, rebuttal rounds stop at the marker, and a start or redo clears it.
+- **Child runs:** `--wait` puts a `waiting-child` checkpoint on the parent. `axp run close` (automatic when a child's panel finishes) passes the child's final outputs to every later stage of the parent. The parent is updated *before* the child is marked closed, so a failure leaves the child open and `axp run close` can be retried. Closing an already-closed child re-delivers its results to a parent that's still waiting on it (same review).
 - **The `/axp-council` skill now drives `axp council`** instead of hand-dispatching each step. The `council` command got its own Codex rule.
 - **Not built:** the `vote` and `merge` stages have instructions but no template uses them yet, and the `on:` rules (§8.2.6) remain Phase 5.
 - **Verified live (2026-10-25):**
