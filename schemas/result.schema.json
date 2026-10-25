@@ -1,0 +1,57 @@
+{
+  "title": "AXP worker result",
+  "description": "Final message every AXP worker (Codex or Claude) must return. Written in the strict subset both engines accept: no $schema or $id keywords, every object closes additionalProperties and lists every property as required; optional values are nullable instead.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["protocol", "task_id", "status", "summary", "artifacts", "findings", "open_questions", "next_actions"],
+  "properties": {
+    "protocol": { "type": "string", "enum": ["axp/1"] },
+    "task_id": { "type": "string" },
+    "status": { "type": "string", "enum": ["done", "partial", "blocked", "failed"] },
+    "summary": { "type": "string" },
+    "artifacts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "title", "content", "derived_from"],
+        "properties": {
+          "kind": { "type": "string", "enum": ["research", "analysis", "plan", "review", "output", "handoff", "decision"] },
+          "title": { "type": "string" },
+          "content": { "type": "string", "description": "Markdown body. The runner, not the worker, writes it to the store and stamps provenance." },
+          "derived_from": { "type": "array", "items": { "type": "string" }, "description": "Artifact ids this one builds on." }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "kind", "severity", "claim", "evidence", "confidence"],
+        "properties": {
+          "id": { "type": "string" },
+          "kind": { "type": "string", "enum": ["defect", "risk", "fact", "recommendation", "question"] },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low", "info"] },
+          "claim": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["type", "ref", "detail"],
+              "properties": {
+                "type": { "type": "string", "enum": ["file", "command", "url", "artifact"] },
+                "ref": { "type": "string" },
+                "detail": { "type": ["string", "null"] }
+              }
+            }
+          },
+          "confidence": { "type": "number" }
+        }
+      }
+    },
+    "open_questions": { "type": "array", "items": { "type": "string" } },
+    "next_actions": { "type": "array", "items": { "type": "string" } }
+  }
+}

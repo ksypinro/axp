@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+.DS_Store
+# axp's own per-project store, if you run axp inside this checkout
+.axp/
